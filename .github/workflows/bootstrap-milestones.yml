@@ -1,4 +1,5 @@
 name: Bootstrap project milestones
+# Idempotent bootstrap for DCON2027 / GCON2026 milestones.
 
 on:
   push:
