@@ -26,8 +26,31 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${PROJECT_TOKEN:-}" ]; then
-            echo "::error::Repository secret PROJECT_TOKEN is required. It must have access to organization Project #2."
+            echo "::error::Repository secret PROJECT_TOKEN is required."
             exit 1
+          fi
+
+      - name: Wait for GraphQL quota if needed
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          rate_json="$(GH_TOKEN="$PROJECT_TOKEN" gh api rate_limit)"
+          remaining="$(echo "$rate_json" | jq -r '.resources.graphql.remaining')"
+          reset_epoch="$(echo "$rate_json" | jq -r '.resources.graphql.reset')"
+          now_epoch="$(date +%s)"
+
+          echo "GraphQL remaining: $remaining"
+
+          if [ "$remaining" -lt 300 ]; then
+            wait_seconds=$((reset_epoch - now_epoch + 10))
+            if [ "$wait_seconds" -gt 0 ] && [ "$wait_seconds" -le 3700 ]; then
+              echo "GraphQL quota is low. Waiting ${wait_seconds}s for reset."
+              sleep "$wait_seconds"
+            else
+              echo "::error::GraphQL quota is too low and reset time could not be safely awaited."
+              exit 1
+            fi
           fi
 
       - name: Ensure project iteration field
@@ -86,39 +109,76 @@ jobs:
 
           echo "START_FIELD_ID=$start_field_id" >> "$GITHUB_ENV"
           echo "TARGET_FIELD_ID=$target_field_id" >> "$GITHUB_ENV"
-          echo "Resolved Start date field: $start_field_id"
-          echo "Resolved Target date field: $target_field_id"
 
-      - name: Apply issue periods and iterations
+      - name: Cache project IDs and current iteration assignments
         shell: bash
         run: |
           set -euo pipefail
 
-          read_iteration_id() {
-            local iteration_title="$1"
-            GH_TOKEN="$PROJECT_TOKEN" gh api graphql               -f query='query($org: String!, $number: Int!) {
-                organization(login: $org) {
-                  projectV2(number: $number) {
-                    fields(first: 100) {
-                      nodes {
-                        ... on ProjectV2IterationField {
-                          name
-                          configuration {
-                            iterations {
-                              id
-                              title
-                            }
+          GH_TOKEN="$PROJECT_TOKEN" gh api graphql             -f query='query($org: String!, $number: Int!) {
+              organization(login: $org) {
+                projectV2(number: $number) {
+                  id
+                  fields(first: 100) {
+                    nodes {
+                      ... on ProjectV2IterationField {
+                        id
+                        name
+                        configuration {
+                          iterations {
+                            id
+                            title
                           }
                         }
                       }
                     }
                   }
+                  items(first: 100) {
+                    nodes {
+                      id
+                      content {
+                        ... on Issue {
+                          number
+                          url
+                        }
+                      }
+                      fieldValueByName(name: "MVP Iteration") {
+                        ... on ProjectV2ItemFieldIterationValue {
+                          iterationId
+                          title
+                        }
+                      }
+                    }
+                  }
                 }
-              }'               -F org="$ORG"               -F number="$PROJECT_NUMBER"               --jq ".data.organization.projectV2.fields.nodes[]
-                    | select(.name == \"MVP Iteration\")
-                    | .configuration.iterations[]
-                    | select(.title == \"$iteration_title\")
-                    | .id"
+              }
+            }'             -F org="$ORG"             -F number="$PROJECT_NUMBER" > /tmp/project.json
+
+          project_id="$(jq -r '.data.organization.projectV2.id' /tmp/project.json)"
+          iteration_field_id="$(jq -r '.data.organization.projectV2.fields.nodes[] | select(.name == "MVP Iteration") | .id' /tmp/project.json)"
+
+          if [ -z "$project_id" ] || [ "$project_id" = "null" ] || [ -z "$iteration_field_id" ] || [ "$iteration_field_id" = "null" ]; then
+            echo "::error::Could not resolve Project or MVP Iteration field."
+            exit 1
+          fi
+
+          echo "PROJECT_ID=$project_id" >> "$GITHUB_ENV"
+          echo "ITERATION_FIELD_ID=$iteration_field_id" >> "$GITHUB_ENV"
+
+      - name: Apply only missing issue periods and iterations
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          iteration_id_for() {
+            local title="$1"
+            jq -r --arg title "$title" '
+              .data.organization.projectV2.fields.nodes[]
+              | select(.name == "MVP Iteration")
+              | .configuration.iterations[]
+              | select(.title == $title)
+              | .id
+            ' /tmp/project.json
           }
 
           issues="$(GH_TOKEN="$REPO_TOKEN" gh issue list --repo "$REPO" --state all --limit 100 --json number,title,url)"
@@ -142,14 +202,27 @@ jobs:
               *) continue ;;
             esac
 
-            # MVP Freeze is due on 11/30 even though it belongs to I7.
             if [ "$number" = "48" ]; then
               target="2026-11-30"
             fi
 
-            # Start date / Target date are organization-level Issue Fields.
-            # They must be updated through the Issue Field Values API, not
-            # updateProjectV2ItemFieldValue.
+            item_id="$(jq -r --argjson number "$number" '
+              .data.organization.projectV2.items.nodes[]
+              | select(.content.number == $number)
+              | .id
+            ' /tmp/project.json | head -n1)"
+
+            current_iteration="$(jq -r --argjson number "$number" '
+              .data.organization.projectV2.items.nodes[]
+              | select(.content.number == $number)
+              | .fieldValueByName.title // ""
+            ' /tmp/project.json | head -n1)"
+
+            if [ -n "$item_id" ] && [ "$item_id" != "null" ] && [ "$current_iteration" = "$iteration" ]; then
+              echo "#$number $prefix already synced; skip"
+              continue
+            fi
+
             jq -n               --argjson start_id "$START_FIELD_ID"               --argjson target_id "$TARGET_FIELD_ID"               --arg start "$start"               --arg target "$target"               '{
                 issue_field_values: [
                   {field_id: $start_id, value: $start},
@@ -157,17 +230,18 @@ jobs:
                 ]
               }'               | GH_TOKEN="$REPO_TOKEN" gh api                   --method POST                   -H "Accept: application/vnd.github+json"                   -H "X-GitHub-Api-Version: 2026-03-10"                   "/repos/$REPO/issues/$number/issue-field-values"                   --input -                   --silent
 
-            # Add the issue to Project #2 if it is not already present.
-            GH_TOKEN="$PROJECT_TOKEN" gh project item-add "$PROJECT_NUMBER" --owner "$ORG" --url "$url" >/dev/null 2>&1 || true
+            if [ -z "$item_id" ] || [ "$item_id" = "null" ]; then
+              item_id="$(GH_TOKEN="$PROJECT_TOKEN" gh project item-add "$PROJECT_NUMBER" --owner "$ORG" --url "$url" --format json --jq '.id')"
+            fi
 
-            iteration_id="$(read_iteration_id "$iteration")"
-            if [ -z "$iteration_id" ]; then
+            iteration_id="$(iteration_id_for "$iteration")"
+            if [ -z "$iteration_id" ] || [ "$iteration_id" = "null" ]; then
               echo "::error::Iteration not found: $iteration"
               exit 1
             fi
 
-            GH_TOKEN="$PROJECT_TOKEN" gh project item-edit "$PROJECT_NUMBER" --owner "$ORG" --url "$url"               --field "MVP Iteration" --iteration-id "$iteration_id" >/dev/null
+            GH_TOKEN="$PROJECT_TOKEN" gh project item-edit               --id "$item_id"               --project-id "$PROJECT_ID"               --field-id "$ITERATION_FIELD_ID"               --iteration-id "$iteration_id"               >/dev/null
 
             echo "#$number $prefix $start -> $target"
-            sleep 0.2
+            sleep 0.25
           done
